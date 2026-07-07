@@ -236,11 +236,10 @@ func (s *storageFS) CreateObject(obj StreamingObject, conditions Conditions) (St
 		return StreamingObject{obj.ObjectAttrs, noopSeekCloser{bytes.NewReader([]byte{})}}, nil
 	}
 
-	var buf bytes.Buffer
 	hasher := checksum.NewStreamingHasher()
 	objectContent := io.TeeReader(obj.Content, hasher)
 
-	if _, err = io.Copy(&buf, objectContent); err != nil {
+	if err = writeFileStream(path, objectContent, 0o600); err != nil {
 		return StreamingObject{}, err
 	}
 
@@ -263,10 +262,6 @@ func (s *storageFS) CreateObject(obj StreamingObject, conditions Conditions) (St
 		return StreamingObject{}, err
 	}
 
-	if err := writeFile(path, buf.Bytes(), 0o600); err != nil {
-		return StreamingObject{}, err
-	}
-
 	if err = s.mh.write(path, encoded); err != nil {
 		return StreamingObject{}, err
 	}
@@ -274,6 +269,16 @@ func (s *storageFS) CreateObject(obj StreamingObject, conditions Conditions) (St
 	err = openObjectAndSetSize(&obj, path)
 
 	return obj, err
+}
+
+// CreateTempFile creates an empty temporary file that can be used to stage the
+// content of an in-progress upload on disk instead of buffering it in memory.
+// The caller is responsible for closing and removing the file.
+//
+// Implementing this method signals to the server that this backend stores
+// content on disk, so resumable uploads should be streamed to disk.
+func (s *storageFS) CreateTempFile() (*os.File, error) {
+	return os.CreateTemp("", "fake-gcs-server-upload-")
 }
 
 // ListObjects lists the objects in a given bucket with a given prefix and

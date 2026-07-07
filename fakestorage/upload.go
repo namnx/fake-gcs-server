@@ -15,6 +15,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -195,29 +196,26 @@ func (s *Server) handleBodyBasedResumableUpload(r *http.Request, body *resumable
 		predefinedACL = body.PredefinedACL
 	}
 
-	// Create an object with the metadata
-	obj := Object{
-		ObjectAttrs: ObjectAttrs{
-			BucketName:         bucketName,
-			Name:               body.Name,
-			StorageClass:       body.StorageClass,
-			ContentType:        body.ContentType,
-			CacheControl:       body.CacheControl,
-			ContentEncoding:    body.ContentEncoding,
-			ContentDisposition: body.ContentDisposition,
-			ContentLanguage:    body.ContentLanguage,
-			CustomTime:         customTime,
-			ACL:                getObjectACL(predefinedACL),
-			Metadata:           body.Metadata,
-		},
+	// Create the metadata for the object being uploaded
+	attrs := ObjectAttrs{
+		BucketName:         bucketName,
+		Name:               body.Name,
+		StorageClass:       body.StorageClass,
+		ContentType:        body.ContentType,
+		CacheControl:       body.CacheControl,
+		ContentEncoding:    body.ContentEncoding,
+		ContentDisposition: body.ContentDisposition,
+		ContentLanguage:    body.ContentLanguage,
+		CustomTime:         customTime,
+		ACL:                getObjectACL(predefinedACL),
+		Metadata:           body.Metadata,
 	}
 
-	// Generate upload ID and store the object for later resumable upload chunks
-	uploadID, err := generateUploadID()
+	// Generate upload ID and store the upload state for later resumable upload chunks
+	uploadID, err := s.registerResumableUpload(attrs)
 	if err != nil {
 		return jsonResponse{errorMessage: err.Error()}
 	}
-	s.uploads.Store(uploadID, obj)
 
 	// Create response headers
 	header := make(http.Header)
@@ -241,7 +239,7 @@ func (s *Server) handleBodyBasedResumableUpload(r *http.Request, body *resumable
 	}
 
 	return jsonResponse{
-		data:   newObjectResponse(obj.ObjectAttrs, s.externalURL),
+		data:   newObjectResponse(attrs, s.externalURL),
 		header: header,
 	}
 }
@@ -605,6 +603,143 @@ func parseContentTypeParams(requestContentType string) (map[string]string, error
 	return params, err
 }
 
+// tempFileBackend is implemented by backends that store object content on disk
+// (currently the filesystem backend). For such backends, resumable upload
+// content is streamed to a temporary file instead of being buffered in memory.
+type tempFileBackend interface {
+	CreateTempFile() (*os.File, error)
+}
+
+// uploadContent is the backing store that accumulates the bytes of an
+// in-progress resumable upload: an in-memory buffer, or a temporary file on
+// disk when the backend stores content on disk.
+type uploadContent interface {
+	io.Writer
+	// reader rewinds the accumulated content and returns it for reading. The
+	// caller must Close the returned reader; for disk-backed uploads that also
+	// removes the temporary file.
+	reader() (io.ReadSeekCloser, error)
+	// cleanup releases the store's resources without committing the upload
+	// (e.g. for an aborted upload). It is safe to call more than once.
+	cleanup()
+}
+
+type memoryUploadContent struct {
+	bytes.Buffer
+}
+
+func (m *memoryUploadContent) reader() (io.ReadSeekCloser, error) {
+	return noopSeekCloser{bytes.NewReader(m.Bytes())}, nil
+}
+
+func (m *memoryUploadContent) cleanup() {}
+
+// tempFileContent is a disk-backed uploadContent. Its reader removes the file
+// once closed, so committed uploads clean up after themselves.
+type tempFileContent struct {
+	*os.File
+}
+
+func (t tempFileContent) reader() (io.ReadSeekCloser, error) {
+	if _, err := t.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+func (t tempFileContent) cleanup() {
+	name := t.Name()
+	t.File.Close()
+	os.Remove(name)
+}
+
+func (t tempFileContent) Close() error {
+	err := t.File.Close()
+	if removeErr := os.Remove(t.Name()); removeErr != nil && err == nil {
+		err = removeErr
+	}
+	return err
+}
+
+// resumableUploadState accumulates the content of an in-progress resumable
+// upload across the sequence of chunk requests, so that large uploads don't
+// have to be held entirely in memory. Checksums and the total size are
+// computed incrementally as chunks arrive.
+type resumableUploadState struct {
+	attrs   ObjectAttrs
+	hasher  *checksum.StreamingHasher
+	size    int64
+	content uploadContent
+}
+
+func (s *Server) newResumableUploadState(attrs ObjectAttrs) (*resumableUploadState, error) {
+	state := &resumableUploadState{
+		attrs:  attrs,
+		hasher: checksum.NewStreamingHasher(),
+	}
+	if b, ok := s.backend.(tempFileBackend); ok {
+		f, err := b.CreateTempFile()
+		if err != nil {
+			return nil, err
+		}
+		state.content = tempFileContent{f}
+	} else {
+		state.content = new(memoryUploadContent)
+	}
+	return state, nil
+}
+
+// registerResumableUpload creates the backing store for a resumable upload,
+// allocates an upload ID, and stores the state so subsequent chunk requests
+// can find it. The backing store is cleaned up if the ID can't be generated.
+func (s *Server) registerResumableUpload(attrs ObjectAttrs) (string, error) {
+	state, err := s.newResumableUploadState(attrs)
+	if err != nil {
+		return "", err
+	}
+	uploadID, err := generateUploadID()
+	if err != nil {
+		state.cleanup()
+		return "", err
+	}
+	s.uploads.Store(uploadID, state)
+	return uploadID, nil
+}
+
+// write appends a chunk of content to the backing store, updating the running
+// checksums and total size.
+func (u *resumableUploadState) write(r io.Reader) error {
+	n, err := io.Copy(io.MultiWriter(u.content, u.hasher), r)
+	u.size += n
+	return err
+}
+
+// refreshChecksums stores the checksums computed so far on the upload's
+// attributes, so that they are reflected in intermediate upload responses.
+func (u *resumableUploadState) refreshChecksums() {
+	u.attrs.Crc32c = u.hasher.EncodedCrc32cChecksum()
+	u.attrs.Md5Hash = u.hasher.EncodedMd5Hash()
+	u.attrs.Etag = u.attrs.Md5Hash
+}
+
+// streamingObject returns a StreamingObject that reads the accumulated content
+// from the beginning, ready to be persisted by the backend. Callers should
+// refresh the checksums beforehand. The caller must Close the returned object;
+// for disk-backed uploads that also removes the temporary file.
+func (u *resumableUploadState) streamingObject() (StreamingObject, error) {
+	content, err := u.content.reader()
+	if err != nil {
+		return StreamingObject{}, err
+	}
+	return StreamingObject{ObjectAttrs: u.attrs, Content: content}, nil
+}
+
+// cleanup releases the resources held by the backing store for an upload that
+// won't be committed (e.g. an aborted or interrupted upload).
+func (u *resumableUploadState) cleanup() {
+	u.content.cleanup()
+}
+
 func (s *Server) resumableUpload(bucketName string, r *http.Request) jsonResponse {
 	if r.URL.Query().Has("upload_id") {
 		return s.uploadFileContent(r)
@@ -628,27 +763,24 @@ func (s *Server) resumableUpload(bucketName string, r *http.Request) jsonRespons
 	if contentEncoding == "" {
 		contentEncoding = metadata.ContentEncoding
 	}
-	obj := Object{
-		ObjectAttrs: ObjectAttrs{
-			BucketName:         bucketName,
-			Name:               objName,
-			StorageClass:       metadata.StorageClass,
-			ContentType:        metadata.ContentType,
-			CacheControl:       metadata.CacheControl,
-			ContentEncoding:    contentEncoding,
-			ContentDisposition: metadata.ContentDisposition,
-			ContentLanguage:    metadata.ContentLanguage,
-			CustomTime:         metadata.CustomTime,
-			ACL:                getObjectACL(predefinedACL),
-			Metadata:           metadata.Metadata,
-			Retention:          convertJsonRetentionToStorage(metadata.Retention),
-		},
+	attrs := ObjectAttrs{
+		BucketName:         bucketName,
+		Name:               objName,
+		StorageClass:       metadata.StorageClass,
+		ContentType:        metadata.ContentType,
+		CacheControl:       metadata.CacheControl,
+		ContentEncoding:    contentEncoding,
+		ContentDisposition: metadata.ContentDisposition,
+		ContentLanguage:    metadata.ContentLanguage,
+		CustomTime:         metadata.CustomTime,
+		ACL:                getObjectACL(predefinedACL),
+		Metadata:           metadata.Metadata,
+		Retention:          convertJsonRetentionToStorage(metadata.Retention),
 	}
-	uploadID, err := generateUploadID()
+	uploadID, err := s.registerResumableUpload(attrs)
 	if err != nil {
 		return jsonResponse{errorMessage: err.Error()}
 	}
-	s.uploads.Store(uploadID, obj)
 	header := make(http.Header)
 	location := fmt.Sprintf(
 		"%s/upload/storage/v1/b/%s/o?uploadType=resumable&name=%s&upload_id=%s",
@@ -663,7 +795,7 @@ func (s *Server) resumableUpload(bucketName string, r *http.Request) jsonRespons
 		header.Set("X-Goog-Upload-Status", "active")
 	}
 	return jsonResponse{
-		data:   newObjectResponse(obj.ObjectAttrs, urlhelper.GetBaseURL(r)),
+		data:   newObjectResponse(attrs, urlhelper.GetBaseURL(r)),
 		header: header,
 	}
 }
@@ -704,29 +836,26 @@ func (s *Server) resumableUpload(bucketName string, r *http.Request) jsonRespons
 // then has a status of "200 OK", with a header "X-Http-Status-Code-Override"
 // set to "308".
 func (s *Server) uploadFileContent(r *http.Request) jsonResponse {
+	defer r.Body.Close()
 	uploadID := r.URL.Query().Get("upload_id")
-	rawObj, ok := s.uploads.Load(uploadID)
+	rawState, ok := s.uploads.Load(uploadID)
 	if !ok {
 		return jsonResponse{status: http.StatusNotFound}
 	}
-	obj := rawObj.(Object)
-	// TODO: stream upload file content to and from disk (when using the FS
-	// backend, at least) instead of loading the entire content into memory.
-	content, err := loadContent(r.Body)
-	if err != nil {
+	state := rawState.(*resumableUploadState)
+	// Stream the chunk straight into the backing store (a temp file on disk
+	// for the FS backend, an in-memory buffer otherwise) instead of loading
+	// the entire object content into memory.
+	if err := state.write(r.Body); err != nil {
 		return jsonResponse{errorMessage: err.Error()}
 	}
 	commit := true
 	status := http.StatusOK
-	obj.Content = append(obj.Content, content...)
-	obj.Crc32c = checksum.EncodedCrc32cChecksum(obj.Content)
-	obj.Md5Hash = checksum.EncodedMd5Hash(obj.Content)
-	obj.Etag = obj.Md5Hash
-	contentTypeHeader := r.Header.Get(contentTypeHeader)
-	if contentTypeHeader != "" {
-		obj.ContentType = contentTypeHeader
-	} else if obj.ContentType == "" {
-		obj.ContentType = "application/octet-stream"
+	state.refreshChecksums()
+	if contentTypeHeader := r.Header.Get(contentTypeHeader); contentTypeHeader != "" {
+		state.attrs.ContentType = contentTypeHeader
+	} else if state.attrs.ContentType == "" {
+		state.attrs.ContentType = "application/octet-stream"
 	}
 	responseHeader := make(http.Header)
 	if contentRange := r.Header.Get("Content-Range"); contentRange != "" {
@@ -741,20 +870,25 @@ func (s *Server) uploadFileContent(r *http.Request) jsonResponse {
 			commit = parsed.KnownTotal && (parsed.End+1 >= parsed.Total)
 		} else {
 			// End of a streaming request
-			responseHeader.Set("Range", fmt.Sprintf("bytes=0-%d", len(obj.Content)))
+			responseHeader.Set("Range", fmt.Sprintf("bytes=0-%d", state.size))
 		}
 	}
+	responseAttrs := state.attrs
 	if commit {
 		s.uploads.Delete(uploadID)
-		streamingObject, err := s.createObject(obj.StreamingObject(), backend.NoConditions{})
+		input, err := state.streamingObject()
+		if err != nil {
+			state.cleanup()
+			return errToJsonResponse(err)
+		}
+		// Closing the input also removes the temp file for disk-backed uploads.
+		defer input.Close()
+		streamingObject, err := s.createObject(input, backend.NoConditions{})
 		if err != nil {
 			return errToJsonResponse(err)
 		}
 		defer streamingObject.Close()
-		obj, err = streamingObject.BufferedObject()
-		if err != nil {
-			return errToJsonResponse(err)
-		}
+		responseAttrs = streamingObject.ObjectAttrs
 	} else {
 		if _, no308 := r.Header["X-Guploader-No-308"]; no308 {
 			// Go client
@@ -763,14 +897,14 @@ func (s *Server) uploadFileContent(r *http.Request) jsonResponse {
 			// Python client
 			status = http.StatusPermanentRedirect
 		}
-		s.uploads.Store(uploadID, obj)
+		s.uploads.Store(uploadID, state)
 	}
 	if r.Header.Get("X-Goog-Upload-Command") == "upload, finalize" {
 		responseHeader.Set("X-Goog-Upload-Status", "final")
 	}
 	return jsonResponse{
 		status: status,
-		data:   newObjectResponse(obj.ObjectAttrs, urlhelper.GetBaseURL(r)),
+		data:   newObjectResponse(responseAttrs, urlhelper.GetBaseURL(r)),
 		header: responseHeader,
 	}
 }
@@ -839,6 +973,11 @@ func parseContentRange(r string) (parsed contentRange, err error) {
 }
 
 func (s *Server) deleteResumableUpload(r *http.Request) jsonResponse {
+	if uploadID := r.URL.Query().Get("upload_id"); uploadID != "" {
+		if rawState, ok := s.uploads.LoadAndDelete(uploadID); ok {
+			rawState.(*resumableUploadState).cleanup()
+		}
+	}
 	return jsonResponse{status: 499}
 }
 

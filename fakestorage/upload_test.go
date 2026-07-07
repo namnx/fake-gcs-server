@@ -33,7 +33,7 @@ func TestServerClientObjectWriter(t *testing.T) {
 	u32Checksum := uint32Checksum([]byte(content))
 	hash := checksum.MD5Hash([]byte(content))
 
-	runServersTest(t, runServersOptions{}, func(t *testing.T, server *Server) {
+	runServersTest(t, runServersOptions{enableFSBackend: true}, func(t *testing.T, server *Server) {
 		tests := []struct {
 			testCase   string
 			bucketName string
@@ -1444,7 +1444,7 @@ func TestParseContentTypeParamsGsutilEdgeCases(t *testing.T) {
 }
 
 func TestBodyBasedResumableUpload(t *testing.T) {
-	runServersTest(t, runServersOptions{}, func(t *testing.T, server *Server) {
+	runServersTest(t, runServersOptions{enableFSBackend: true}, func(t *testing.T, server *Server) {
 		bucketName := "test-bucket"
 		server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName})
 
@@ -1659,7 +1659,7 @@ func TestBodyBasedResumableUpload(t *testing.T) {
 }
 
 func TestResumableUploadContentType(t *testing.T) {
-	runServersTest(t, runServersOptions{}, func(t *testing.T, server *Server) {
+	runServersTest(t, runServersOptions{enableFSBackend: true}, func(t *testing.T, server *Server) {
 		const bucketName = "test-bucket"
 
 		t.Run("content type from session metadata is preserved", func(t *testing.T) {

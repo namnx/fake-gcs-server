@@ -464,6 +464,14 @@ func (s *Server) Stop() {
 	if s.ts != nil {
 		s.ts.Close()
 	}
+	// Remove any temp files backing in-progress resumable uploads.
+	s.uploads.Range(func(key, value any) bool {
+		if state, ok := value.(*resumableUploadState); ok {
+			state.cleanup()
+		}
+		s.uploads.Delete(key)
+		return true
+	})
 	s.notificationRegistry.Close()
 }
 
